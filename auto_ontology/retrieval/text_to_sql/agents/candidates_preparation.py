@@ -36,6 +36,7 @@ from auto_ontology.dal.attributes import (
     find_connected_junction_tables,
     find_join_path,
     find_kept_table_bridges,
+    find_specific_bridges_between_kept_tables,
 )
 from auto_ontology.dal.custom_analyses import (
     fetch_custom_analyses_with_sql,
@@ -714,6 +715,29 @@ class CandidatePreparationAgent(BaseAgent):
                 "Pairwise bridge reconciliation added %d join path(s) for "
                 "bridge table(s)",
                 len(bridge_paths),
+            )
+
+        # A kept filter table that was never a retrieval candidate for its
+        # intermediate tables stays disconnected, and SQL generation then
+        # drops the filter. These intermediates were not shown to the
+        # relevance filter; the walk only accepts a specific semantic-FK
+        # path and refuses a shared-dimension hub.
+        specific_tables, specific_paths = find_specific_bridges_between_kept_tables(
+            kept_ids
+        )
+        if specific_tables:
+            forced_table_ids.update(t["id"] for t in specific_tables)
+            self.logger.info(
+                "Specific join-path completion added %d intermediate table(s) "
+                "between otherwise disconnected kept tables: %s",
+                len(specific_tables),
+                [t["name"] for t in specific_tables],
+            )
+        if specific_paths:
+            attribute_join_paths.extend({"path": hops} for hops in specific_paths)
+            self.logger.info(
+                "Specific join-path completion added %d join path(s)",
+                len(specific_paths),
             )
 
         forced_table_ids -= {t.get("id") for t in relevant_tables}

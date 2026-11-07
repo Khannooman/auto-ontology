@@ -29,9 +29,13 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
+import sqlglot
+from sqlglot import exp
+
 from auto_ontology.retrieval.text_to_sql.agents.empty_like_result_check import (
     _get_sql_code,
     _is_empty_db_result,
+    _parse_db_rows,
 )
 from auto_ontology.retrieval.text_to_sql.base import BaseAgent
 from auto_ontology.retrieval.text_to_sql.connector_routing import (
@@ -70,6 +74,50 @@ def build_empty_result_retry_error() -> str:
     )
 
 
+def _outer_select(sql: str) -> exp.Select | None:
+    """The statement itself when it is one ``SELECT``, otherwise nothing.
+
+    A parse failure or a ``UNION`` stays out of the null-aggregate path.
+    Those shapes are left to the existing empty-result check.
+    """
+    try:
+        tree = sqlglot.parse_one(sql, read="postgres")
+    except Exception:  # noqa: BLE001 — unparsable SQL is not a null aggregate
+        return None
+    return tree if isinstance(tree, exp.Select) else None
+
+
+def _is_aggregate_expression(expression: exp.Expression) -> bool:
+    node = expression
+    while isinstance(node, (exp.Alias, exp.Paren)):
+        node = node.this
+    return isinstance(node, exp.AggFunc)
+
+
+def _is_scalar_null_aggregate(sql: str, db_result: Any) -> bool:
+    """One-row scalar aggregate whose every value is JSON null.
+
+    ``SUM`` over no input rows returns one row of NULL, so the empty-result
+    check never sees it and the literal probe never runs. ``COUNT`` of no
+    rows and ``SUM`` of real zeros are numeric zeros, and a selected NULL
+    column is not an aggregate, so neither is included. A grouped aggregate
+    can legitimately be NULL for a group that exists.
+    """
+    rows = _parse_db_rows(db_result)
+    if len(rows) != 1:
+        return False
+    values = list(rows[0].values())
+    if not values or any(value is not None for value in values):
+        return False
+    select = _outer_select(sql or "")
+    if select is None or select.args.get("group") is not None:
+        return False
+    expressions = select.expressions or []
+    return bool(expressions) and all(
+        _is_aggregate_expression(expression) for expression in expressions
+    )
+
+
 class EmptyResultValueRepairAgent(BaseAgent):
     """Repair a bad filter literal, or regenerate an empty result outright."""
 
@@ -89,9 +137,13 @@ class EmptyResultValueRepairAgent(BaseAgent):
         db_result = path_state.get("sql_response_from_db")
 
         empty = _is_empty_db_result(db_result)
+        # A scalar SUM/AVG/MIN/MAX over no rows is one JSON-null row, not an
+        # empty list. Probe it the same way. A zero, a count of zero, or a
+        # null selected from a real row stays a result.
+        null_aggregate = not empty and _is_scalar_null_aggregate(sql_code, db_result)
 
         # Common path: query returned rows → nothing to repair, zero cost.
-        if not empty:
+        if not empty and not null_aggregate:
             return {"decision": "valid_sql", "path_state": path_state}
 
         mismatches: list[dict[str, Any]] = []
@@ -127,6 +179,17 @@ class EmptyResultValueRepairAgent(BaseAgent):
                 [f"{m['table']}.{m['column']}='{m['used']}'" for m in mismatches],
             )
             return {"decision": "invalid_sql", "path_state": path_state}
+
+        if null_aggregate:
+            # The probe saw no case or whitespace variant. The NULL may be the
+            # stored measure, so it is not rewritten to zero and not sent
+            # through the undiagnosed regeneration used for an empty list.
+            self.logger.info(
+                "[%s] Scalar aggregate is NULL and no stored string variant "
+                "matched the filter — leaving the NULL in place",
+                path_state.get("task_id", "?"),
+            )
+            return {"decision": "valid_sql", "path_state": path_state}
 
         if path_state.get("empty_result_retry_attempted"):
             self.logger.info(

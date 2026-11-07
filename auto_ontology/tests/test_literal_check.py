@@ -288,6 +288,37 @@ def test_high_cardinality_literal_that_exists_costs_no_variant_scan():
     assert executor.calls == 2  # DISTINCT + exact lookup, no variant scan
 
 
+def test_high_cardinality_trailing_whitespace_is_a_repairable_variant():
+    """A stored value that differs only by outer whitespace is a near-miss.
+
+    The point lookup finds it on a high-cardinality column, and the repair
+    instruction compares that column with TRIM instead of asking the model to
+    reproduce a space it cannot see.
+    """
+    connector = _ScriptedConnector(
+        [
+            _high_card_values(),
+            pd.DataFrame({"hit": []}),
+            pd.DataFrame({"value": ["flash drive "]}),
+        ]
+    )
+    executor = ProbeExecutor(connector=connector)
+    sql = "SELECT SUM(amount) AS total FROM items WHERE label = 'flash drive'"
+
+    mismatches = find_literal_mismatches(
+        executor, "postgres", sql, result_was_empty=True
+    )
+
+    assert len(mismatches) == 1
+    assert mismatches[0]["kind"] == "string"
+    assert mismatches[0]["column"] == "label"
+    assert mismatches[0]["used"] == "flash drive"
+    assert mismatches[0]["suggested"] == ["flash drive "]
+    error = build_value_repair_error(mismatches)
+    assert "LOWER(TRIM(label::text))" in error
+    assert "Closest real value(s)" not in error
+
+
 def test_high_cardinality_literal_absent_with_no_variant_is_left_alone():
     """A value that exists in no casing at all is not a repair target — the
     empty result may well be the correct answer, same rule the low-cardinality

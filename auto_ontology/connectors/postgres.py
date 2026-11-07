@@ -30,6 +30,38 @@ def _fetch_frame(
     return pd.DataFrame(rows)
 
 
+# ``constraint_column_usage.table_schema`` is the *referenced* table's schema,
+# not the constraint's. Joining it to the source table's schema drops every
+# foreign key that crosses schemas. Wide World Importers keeps 98 foreign keys
+# and that join returned the 39 that stay inside one schema.
+# ``referential_constraints`` names the constraint schema and the referenced
+# unique constraint's schema separately, and the ordinal match keeps composite
+# keys paired. A test imports this string so the join cannot regress silently.
+_FOREIGN_KEY_SQL = """
+            SELECT
+                kcu.table_schema         AS table_schema,
+                kcu.table_name           AS table_name,
+                kcu.column_name          AS column_name,
+                ccu.table_schema         AS referenced_schema,
+                ccu.table_name           AS referenced_table,
+                ccu.column_name          AS referenced_column
+            FROM information_schema.table_constraints tc
+            JOIN information_schema.key_column_usage kcu
+              ON tc.constraint_name = kcu.constraint_name
+             AND tc.constraint_schema = kcu.constraint_schema
+            JOIN information_schema.referential_constraints rc
+              ON tc.constraint_name = rc.constraint_name
+             AND tc.constraint_schema = rc.constraint_schema
+            JOIN information_schema.key_column_usage ccu
+              ON rc.unique_constraint_name = ccu.constraint_name
+             AND rc.unique_constraint_schema = ccu.constraint_schema
+             AND kcu.position_in_unique_constraint = ccu.ordinal_position
+            WHERE tc.constraint_type = 'FOREIGN KEY'
+              AND tc.table_schema NOT IN ('pg_catalog', 'information_schema')
+            ORDER BY kcu.table_schema, kcu.table_name, kcu.column_name
+        """
+
+
 class PostgresDatabase(SQLDatabase):
     """Concrete :class:`SQLDatabase` backed by ``psycopg`` (v3).
 
@@ -270,25 +302,7 @@ class PostgresDatabase(SQLDatabase):
         """)
 
     def get_fks(self) -> pd.DataFrame:
-        return self.execute("""
-            SELECT
-                kcu.table_schema         AS table_schema,
-                kcu.table_name           AS table_name,
-                kcu.column_name          AS column_name,
-                ccu.table_schema         AS referenced_schema,
-                ccu.table_name           AS referenced_table,
-                ccu.column_name          AS referenced_column
-            FROM information_schema.table_constraints tc
-            JOIN information_schema.key_column_usage kcu
-              ON tc.constraint_name = kcu.constraint_name
-             AND tc.table_schema    = kcu.table_schema
-            JOIN information_schema.constraint_column_usage ccu
-              ON tc.constraint_name = ccu.constraint_name
-             AND tc.table_schema    = ccu.table_schema
-            WHERE tc.constraint_type = 'FOREIGN KEY'
-              AND tc.table_schema NOT IN ('pg_catalog', 'information_schema')
-            ORDER BY kcu.table_schema, kcu.table_name, kcu.column_name
-        """)
+        return self.execute(_FOREIGN_KEY_SQL)
 
     # ------------------------------------------------------------------
     # Lifecycle

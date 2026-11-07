@@ -37,6 +37,7 @@ from auto_ontology.connectors.base import SQLDatabase
 from auto_ontology.dal.attributes import (
     delete_semantic_fk,
     fetch_semantic_fk_join_groups,
+    find_attributed_declared_fks_without_semantic_edge,
     find_column_attribute_by_column_id,
     find_unlinked_fk_columns,
     merge_semantic_fk,
@@ -86,6 +87,36 @@ Choose the relationship that most naturally represents an unqualified join betwe
 the source and target tables. Return exactly one supplied source_column_id. Return
 null only when the schema context is genuinely insufficient. Never invent an ID.
 """
+
+
+def link_attributed_declared_foreign_keys(database_name: str) -> int:
+    """Write semantic edges for declared FKs that taxonomy already modeled.
+
+    Returns how many edges were written. Does not infer, embed, or call a
+    model: the catalog foreign key and the target column's attribute are
+    enough. Columns with an attribute and no declared foreign key are left
+    alone.
+    """
+    written = 0
+    for col in find_attributed_declared_fks_without_semantic_edge(database_name):
+        attr_id = find_column_attribute_by_column_id(col["fk_target_col_id"])
+        if not attr_id:
+            logger.info(
+                "resolve_semantic_fks [declared attribute]: %s.%s target has no "
+                "column attribute — left unlinked",
+                col.get("table_name"),
+                col.get("name"),
+            )
+            continue
+        if merge_semantic_fk(col["id"], attr_id):
+            written += 1
+            logger.info(
+                "resolve_semantic_fks [declared attribute]: %s.%s → attr %s",
+                col.get("table_name"),
+                col.get("name"),
+                attr_id,
+            )
+    return written
 
 
 def resolve_semantic_fks(database_name: str) -> int:
@@ -217,6 +248,8 @@ def _resolve_semantic_fks(database_name: str) -> int:
                 llm_queue.append((index, col))
         else:
             llm_queue.append((index, col))
+
+    declared_written += link_attributed_declared_foreign_keys(database_name)
 
     logger.info(
         "resolve_semantic_fks: %d declared FK(s) resolved; %d queued for inference",

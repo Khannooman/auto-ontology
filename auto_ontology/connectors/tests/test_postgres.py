@@ -144,3 +144,20 @@ def test_nullability_is_a_real_boolean(pagila) -> None:
     # The real assertion: a mix, not a column of all-True. The bug's signature
     # was every column agreeing.
     assert 0 < int(columns.is_nullable.sum()) < len(columns)
+
+
+def test_foreign_key_sql_keeps_a_target_in_another_schema() -> None:
+    """A cross-schema foreign key must survive introspection.
+
+    Joining ``constraint_column_usage`` on the source table's schema drops
+    every foreign key whose target lives in a different schema. The query
+    has to identify the constraint and the referenced unique key by their
+    own schemas.
+    """
+    from auto_ontology.connectors.postgres import _FOREIGN_KEY_SQL
+
+    compact = " ".join(_FOREIGN_KEY_SQL.split())
+    assert "referential_constraints" in compact
+    assert "rc.unique_constraint_schema = ccu.constraint_schema" in compact
+    assert "kcu.position_in_unique_constraint = ccu.ordinal_position" in compact
+    assert "tc.table_schema = ccu.table_schema" not in compact
