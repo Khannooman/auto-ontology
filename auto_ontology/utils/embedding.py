@@ -23,6 +23,7 @@ from __future__ import annotations
 import itertools
 import logging
 import math
+import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -96,6 +97,58 @@ class EmbedParams:
     inference_batch_size: int = 32
     nim_http_max_concurrent: int = 32
     request_timeout_s: float = 600.0
+
+    def __post_init__(self) -> None:
+        """Apply a hosted-endpoint batch that this model actually accepts.
+
+        The dataclass defaults (32 and 32) are the upstream values and stay in
+        force for every other endpoint, including a self-hosted NIM. On
+        2026-11-07 ``integrate.api.nvidia.com`` returned HTTP 500
+        ``service inference failed`` in about 30ms for
+        ``nvidia/nemotron-3.5-embed-1b`` whenever one request contained two or
+        more passages, including short ones. A single passage returned a
+        2048-d vector, and four concurrent single-text requests all succeeded.
+        With the upstream batch, catalog ingest logged success and wrote zero
+        embedding rows.
+
+        ``EMBED_INFERENCE_BATCH_SIZE`` and ``EMBED_HTTP_MAX_CONCURRENT``
+        override this, so a later endpoint that accepts a wider batch can be
+        configured without another code change. An invalid value is ignored.
+        """
+        batch = _env_positive_int("EMBED_INFERENCE_BATCH_SIZE")
+        concurrent = _env_positive_int("EMBED_HTTP_MAX_CONCURRENT")
+        if batch is None and _hosted_nemotron_embed(self):
+            batch = 1
+        if concurrent is None and _hosted_nemotron_embed(self):
+            concurrent = 4
+        if batch is not None:
+            object.__setattr__(self, "inference_batch_size", batch)
+        if concurrent is not None:
+            object.__setattr__(self, "nim_http_max_concurrent", concurrent)
+
+
+def _env_positive_int(name: str) -> int | None:
+    """A positive integer from the environment, or None when unset or invalid."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Ignoring %s; expected a positive integer", name)
+        return None
+    if value < 1:
+        logger.warning("Ignoring %s=%s; expected a positive integer", name, value)
+        return None
+    return value
+
+
+def _hosted_nemotron_embed(params: EmbedParams) -> bool:
+    """True for the hosted nemotron embed model whose multi-text batch 500s."""
+    host = params.embed_invoke_url or ""
+    model = (params.model_name or "").lower()
+    hosted = "integrate.api.nvidia.com" in host or "ai.api.nvidia.com" in host
+    return hosted and "nemotron" in model and "embed" in model
 
 
 def get_embed_params() -> EmbedParams:

@@ -5,6 +5,7 @@
 """LLM client construction and structured-output invocation wrappers."""
 
 import contextlib
+import json
 import logging
 import os
 import random
@@ -477,6 +478,60 @@ def _structured_output_kwargs(llm: BaseChatModel) -> dict:
     return {}
 
 
+def _hosted_nvidia_chat(llm: BaseChatModel) -> bool:
+    """True when this client talks to the hosted NVIDIA API catalog.
+
+    ``ChatNVIDIA.with_structured_output`` ignores a ``method`` argument and,
+    for a hosted base URL, tries OpenAI ``response_format``, then top-level
+    ``guided_json``, then ``nvext.guided_json``. The last of those is HTTP 400
+    ``unknown field guided_json`` on ``integrate.api.nvidia.com``, and the
+    library raises that last exception. Tool calls against the same model
+    returned schema-valid objects for ``QuestionExtractionModel`` and
+    ``TableRelevanceModel`` (measured 2026-11-07). A self-hosted NIM keeps the
+    upstream ``with_structured_output`` path.
+    """
+    if type(llm).__name__ != "ChatNVIDIA":
+        return False
+    base_url = str(getattr(llm, "base_url", "") or "")
+    return "integrate.api.nvidia.com" in base_url or "ai.api.nvidia.com" in base_url
+
+
+def _invoke_hosted_nvidia_structured(
+    llm: BaseChatModel,
+    messages: list[BaseMessage],
+    schema: Type[T],
+) -> T | None:
+    """Ask the hosted NVIDIA chat model for one tool call and validate it.
+
+    Returns None when the model answers without a tool call, so the caller's
+    existing retry applies. Schema validation is unchanged: a payload that
+    does not match ``schema`` still raises ``ValidationError``.
+    """
+    name = getattr(schema, "__name__", "StructuredOutput")
+    description = (getattr(schema, "__doc__", None) or name).strip()
+    tool = {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description[:1000],
+            "parameters": schema.model_json_schema(),
+        },
+    }
+    response = llm.bind_tools([tool], tool_choice=name).invoke(messages)
+    calls = getattr(response, "tool_calls", None) or []
+    if not calls or not isinstance(calls[0], dict):
+        return None
+    args = calls[0].get("args")
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(args, dict):
+        return None
+    return schema.model_validate(args)
+
+
 def _invoke_text_once(llm: BaseChatModel, prompt: str) -> str:
     response = llm.invoke([HumanMessage(content=prompt)])
     content = getattr(response, "content", response)
@@ -565,9 +620,13 @@ def safe_invoke_with_structured_output(
 
     for attempt in range(RETRY_MAX_ATTEMPTS):
         try:
-            model_llm = llm.with_structured_output(schema, **structured_kwargs)
+            prepared = _system_messages_first(llm, current_messages)
             with _inflight_guard():
-                result = model_llm.invoke(_system_messages_first(llm, current_messages))
+                if _hosted_nvidia_chat(llm):
+                    result = _invoke_hosted_nvidia_structured(llm, prepared, schema)
+                else:
+                    model_llm = llm.with_structured_output(schema, **structured_kwargs)
+                    result = model_llm.invoke(prepared)
         except _requests.exceptions.ReadTimeout:
             logger.error(
                 "LLM invoke timed out after %ds on attempt %d/%d for %s",
