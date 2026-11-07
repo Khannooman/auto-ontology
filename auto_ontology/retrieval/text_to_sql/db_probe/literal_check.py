@@ -739,6 +739,7 @@ def _check_high_card_literals(
                 # Deliberately empty: the column has too many distinct values to
                 # quote back, and the variants above are the whole point anyway.
                 "actual": [],
+                "dialect": dialect,
             }
         )
     return out
@@ -859,6 +860,7 @@ def find_literal_mismatches(
                     "used": used,
                     "suggested": suggested,
                     "actual": actual,
+                    "dialect": dialect,
                 }
             )
 
@@ -897,12 +899,38 @@ def find_literal_mismatches(
 def _render_string_mismatch(m: dict[str, Any]) -> str:
     # No actual-value list for a high-cardinality column — too many to quote.
     actual = m.get("actual") or []
+    suggested_values = list(m["suggested"])
+    # The stored value matches once case and outer whitespace are ignored.
+    # Quote a visible spelling or case difference. Outer whitespace alone is
+    # not quoted: reconstruction cannot reliably copy a character it cannot
+    # see, and only this column is compared with TRIM.
+    if suggested_values and all(
+        _norm(value) == _norm(m["used"]) for value in suggested_values
+    ):
+        cast_col = _text_cast(m["column"], m.get("dialect"))
+        visible = [
+            value
+            for value in suggested_values
+            if str(value).strip() != str(m["used"]).strip()
+        ]
+        quoted = (
+            f" Closest real value(s): {', '.join(str(value) for value in visible)}."
+            if visible
+            else ""
+        )
+        return (
+            f"- Column {m['table']}.{m['column']}: your filter used '{m['used']}', "
+            f"which is not stored exactly. The same value is stored with different "
+            f"case or outer whitespace, so compare "
+            f"LOWER(TRIM({cast_col})) = LOWER(TRIM('{m['used']}')) "
+            f"on this column only.{quoted}"
+        )
     actual_clause = (
         f"Actual values are [{', '.join(str(v) for v in actual[:20])}]. "
         if actual
         else ""
     )
-    suggested = ", ".join(str(v) for v in m["suggested"])
+    suggested = ", ".join(str(v) for v in suggested_values)
     return (
         f"- Column {m['table']}.{m['column']}: your filter used '{m['used']}', "
         f"which does not exist in the database and returns no rows. "
