@@ -1291,3 +1291,210 @@ def test_kept_table_bridges_respects_the_cap(bridged) -> None:
     )
     assert (bridge_tables, bridge_paths) == ([], [])
     assert skipped == 1
+
+
+def test_attributed_declared_foreign_key_stays_a_semantic_candidate(world) -> None:
+    """An FK column that already has an attribute is still an unresolved reference.
+
+    Taxonomy modeling the column as its own term's attribute must not hide
+    the declared foreign key from semantic-edge resolution.
+    """
+    world.table("orders", pk=["id"])
+    world.column("orders", "id")
+    world.column("orders", "customer_id", 2)
+    world.column("orders", "note", 3)
+    world.attribute("order-customer", owner="orders.customer_id")
+    world.attribute("order-note", owner="orders.note")
+    world.table("customers", pk=["id"])
+    world.column("customers", "id")
+    world.attribute("customer-id", owner="customers.id")
+    _link(
+        s.column__foreign_key,
+        source_column_id=world.columns["orders.customer_id"],
+        target_column_id=world.columns["customers.id"],
+    )
+
+    found = {
+        row["id"] for row in a.find_attributed_declared_fks_without_semantic_edge()
+    }
+
+    assert world.columns["orders.customer_id"] in found
+    assert world.columns["orders.note"] not in found
+    assert world.columns["orders.id"] not in found
+
+
+def test_disconnected_kept_tables_use_the_specific_path_not_the_shared_hub(
+    world,
+) -> None:
+    """Two kept tables connect through their real intermediates, not a hub.
+
+    ``orders → customers → places → regions`` is the relationship. A shorter
+    path ``orders → people ← regions`` exists because both also reference a
+    shared person table. The person table is referenced widely enough to be
+    a shared dimension, so it must not be the bridge that completion adds.
+    """
+    world.table("orders", pk=["id"])
+    world.column("orders", "customer_id")
+    world.column("orders", "editor_id", 2)
+    world.table("customers", pk=["id"])
+    world.column("customers", "id")
+    world.column("customers", "place_id", 2)
+    world.table("places", pk=["id"])
+    world.column("places", "id")
+    world.column("places", "region_id", 2)
+    world.table("regions", pk=["id"])
+    world.column("regions", "id")
+    world.column("regions", "editor_id", 2)
+    world.table("people", pk=["id"])
+    world.column("people", "id")
+
+    world.attribute("customer-id", owner="customers.id")
+    world.attribute("place-id", owner="places.id")
+    world.attribute("region-id", owner="regions.id")
+    world.attribute("person-id", owner="people.id")
+    world.references("orders.customer_id", "customer-id")
+    world.references("customers.place_id", "place-id")
+    world.references("places.region_id", "region-id")
+    world.references("orders.editor_id", "person-id")
+    world.references("regions.editor_id", "person-id")
+    for index in range(12):
+        name = f"audit_{index}"
+        world.table(name)
+        world.column(name, "editor_id")
+        world.references(f"{name}.editor_id", "person-id")
+
+    tables, paths = a.find_specific_bridges_between_kept_tables(
+        [world.tables["orders"], world.tables["regions"]]
+    )
+
+    assert {table["name"] for table in tables} == {"customers", "places"}
+    assert paths
+    joined = {
+        (hop["source_table"], hop["source_column"], hop["target_table"])
+        for path in paths
+        for hop in path
+    }
+    assert ("orders", "customer_id", "customers") in joined
+    assert ("customers", "place_id", "places") in joined
+    assert ("places", "region_id", "regions") in joined
+    assert all(hop["target_table"] != "people" for path in paths for hop in path)
+
+
+def test_shorter_specific_path_beats_a_longer_lower_fanin_path(world) -> None:
+    """Hop count wins over a longer route whose intermediates are less shared.
+
+    ``orders → customers → regions`` is the short relationship. ``customers``
+    is referenced twice, so its fan-in is higher than ``lane``, ``dock``, and
+    ``bay``. The longer chain must not be chosen just because each of those
+    tables has a smaller fan-in.
+    """
+    world.table("orders", pk=["id"])
+    world.column("orders", "customer_id")
+    world.column("orders", "lane_id", 2)
+    world.table("customers", pk=["id"])
+    world.column("customers", "id")
+    world.column("customers", "region_id", 2)
+    world.table("notes")
+    world.column("notes", "customer_id")
+    world.table("regions", pk=["id"])
+    world.column("regions", "id")
+    world.table("lane", pk=["id"])
+    world.column("lane", "id")
+    world.column("lane", "dock_id", 2)
+    world.table("dock", pk=["id"])
+    world.column("dock", "id")
+    world.column("dock", "bay_id", 2)
+    world.table("bay", pk=["id"])
+    world.column("bay", "id")
+    world.column("bay", "region_id", 2)
+
+    world.attribute("customer-id", owner="customers.id")
+    world.attribute("region-id", owner="regions.id")
+    world.attribute("lane-id", owner="lane.id")
+    world.attribute("dock-id", owner="dock.id")
+    world.attribute("bay-id", owner="bay.id")
+    world.references("orders.customer_id", "customer-id")
+    world.references("notes.customer_id", "customer-id")
+    world.references("customers.region_id", "region-id")
+    world.references("orders.lane_id", "lane-id")
+    world.references("lane.dock_id", "dock-id")
+    world.references("dock.bay_id", "bay-id")
+    world.references("bay.region_id", "region-id")
+
+    tables, paths = a.find_specific_bridges_between_kept_tables(
+        [world.tables["orders"], world.tables["regions"]]
+    )
+
+    assert {table["name"] for table in tables} == {"customers"}
+    joined = {
+        (hop["source_table"], hop["source_column"], hop["target_table"])
+        for path in paths
+        for hop in path
+    }
+    assert ("orders", "customer_id", "customers") in joined
+    assert ("customers", "region_id", "regions") in joined
+    assert all(
+        hop["target_table"] not in {"lane", "dock", "bay"}
+        for path in paths
+        for hop in path
+    )
+
+
+def test_already_selected_intermediate_does_not_consume_the_cap_twice(
+    world,
+) -> None:
+    """A bridge table already added is not charged against the cap again.
+
+    The first path spends two of four slots. The second path repeats the
+    first intermediate and adds two new tables. Counting the repeated table
+    again would make five and drop the second path.
+    """
+    world.table("orders", pk=["id"])
+    world.column("orders", "alpha_id")
+    world.table("regions", pk=["id"])
+    world.column("regions", "id")
+    world.table("shipments", pk=["id"])
+    world.column("shipments", "id")
+    world.table("alpha", pk=["id"])
+    world.column("alpha", "id")
+    world.column("alpha", "beta_id", 2)
+    world.column("alpha", "gamma_id", 3)
+    world.table("beta", pk=["id"])
+    world.column("beta", "id")
+    world.column("beta", "region_id", 2)
+    world.table("gamma", pk=["id"])
+    world.column("gamma", "id")
+    world.column("gamma", "delta_id", 2)
+    world.table("delta", pk=["id"])
+    world.column("delta", "id")
+    world.column("delta", "shipment_id", 2)
+
+    world.attribute("alpha-id", owner="alpha.id")
+    world.attribute("beta-id", owner="beta.id")
+    world.attribute("region-id", owner="regions.id")
+    world.attribute("gamma-id", owner="gamma.id")
+    world.attribute("delta-id", owner="delta.id")
+    world.attribute("shipment-id", owner="shipments.id")
+    world.references("orders.alpha_id", "alpha-id")
+    world.references("alpha.beta_id", "beta-id")
+    world.references("beta.region_id", "region-id")
+    world.references("alpha.gamma_id", "gamma-id")
+    world.references("gamma.delta_id", "delta-id")
+    world.references("delta.shipment_id", "shipment-id")
+
+    tables, paths = a.find_specific_bridges_between_kept_tables(
+        [
+            world.tables["orders"],
+            world.tables["regions"],
+            world.tables["shipments"],
+        ],
+        max_new_tables=4,
+    )
+
+    assert {table["name"] for table in tables} == {
+        "alpha",
+        "beta",
+        "gamma",
+        "delta",
+    }
+    assert len(paths) == 2

@@ -12,6 +12,7 @@ run BFS over tables while retaining the exact join columns on every edge.
 from __future__ import annotations
 
 from collections import defaultdict, deque
+import heapq
 import itertools
 import logging
 from typing import Any
@@ -47,6 +48,14 @@ logger = logging.getLogger(__name__)
 #: perfectly ordinary 4-hop path is 14, and a ceiling of 10 would have silently
 #: returned "no path" for it.
 MAX_PATH_DEPTH = 30
+
+# A table referenced by at least this many other tables is a shared dimension
+# (an audit person, a status code). Measured on the Wide World Importers
+# catalog: ``people`` is referenced by 29 tables and the next table by 7.
+# A path through that kind of hub is not how two kept tables should be
+# connected when a lower-fan-in path exists, and it is not used when it is
+# the only path either — joining through it answers a different question.
+SHARED_DIMENSION_FANIN = 12
 
 
 # ---------------------------------------------------------------------------
@@ -517,6 +526,68 @@ def find_unlinked_fk_columns(
     return [dict(r) for r in store().query_read(statement)]
 
 
+def find_attributed_declared_fks_without_semantic_edge(
+    database_name: str | None = None,
+) -> list[dict[str, Any]]:
+    """Declared foreign keys that already have a column attribute and no semantic edge.
+
+    ``find_unlinked_fk_columns`` only returns a column that has neither edge.
+    Taxonomy often models an FK column as an attribute of its own term
+    (``Customer.Delivery City ID``) and the declared reference
+    (``customers.deliverycityid`` → ``cities.cityid``) is then never written.
+    Join paths stop at that column. This list is the declared-FK fast path
+    only: there is no inference, and a column with an attribute but no
+    declared foreign key is not included.
+    """
+    statement = (
+        select(
+            s.catalog_column.c.id,
+            s.catalog_column.c.name,
+            s.catalog_table.c.id.label("table_id"),
+            s.catalog_table.c.name.label("table_name"),
+            s.column__foreign_key.c.target_column_id.label("fk_target_col_id"),
+            _fk_target_table.c.id.label("fk_target_table_id"),
+        )
+        .select_from(
+            s.catalog_column.join(
+                s.catalog_table, s.catalog_table.c.id == s.catalog_column.c.table_id
+            )
+            .join(
+                s.column__foreign_key,
+                s.column__foreign_key.c.source_column_id == s.catalog_column.c.id,
+            )
+            .join(
+                _fk_target_column,
+                _fk_target_column.c.id == s.column__foreign_key.c.target_column_id,
+            )
+            .join(
+                _fk_target_table,
+                _fk_target_table.c.id == _fk_target_column.c.table_id,
+            )
+        )
+        .where(
+            ~select(s.column__semantic_fk.c.attribute_id)
+            .where(s.column__semantic_fk.c.column_id == s.catalog_column.c.id)
+            .exists(),
+            select(s.column__has_attribute.c.attribute_id)
+            .where(s.column__has_attribute.c.column_id == s.catalog_column.c.id)
+            .exists(),
+            _fk_target_table.c.id != s.catalog_table.c.id,
+        )
+    )
+    if database_name is not None:
+        statement = statement.select_from(
+            s.catalog_schema.join(
+                s.catalog_database,
+                s.catalog_database.c.id == s.catalog_schema.c.database_id,
+            )
+        ).where(
+            s.catalog_table.c.schema_id == s.catalog_schema.c.id,
+            s.catalog_database.c.name == database_name,
+        )
+    return [dict(r) for r in store().query_read(statement)]
+
+
 def _same_database(src_column_id: str, tgt_attr_id: str) -> bool:
     """Whether *src_column_id* and *tgt_attr_id* belong to the same database."""
     col_ctx = fetch_col_table_contexts([src_column_id])
@@ -789,6 +860,40 @@ _SEMANTIC_TABLE_EDGES = (
 )
 
 
+def _semantic_table_graph(
+    database_id: str,
+) -> tuple[dict[str, list[tuple[str, str, str]]], dict[str, int]]:
+    """Table adjacency and fan-in for one database's semantic foreign keys.
+
+    Adjacency values are ``(next_table_id, source_column_id, target_column_id)``,
+    sorted so a walk is stable. Fan-in counts distinct source tables with a
+    semantic FK *into* a table, before the reverse primary-key edges are
+    added, so a popular parent is visible as a hub.
+    """
+    rows = store().query_read(
+        _SEMANTIC_TABLE_EDGES,
+        {"database_id": database_id},
+    )
+    adjacency: dict[str, list[tuple[str, str, str]]] = defaultdict(list)
+    incoming: dict[str, set[str]] = defaultdict(set)
+    for row in rows:
+        fk_table_id = row["fk_table_id"]
+        owner_table_id = row["owner_table_id"]
+        if fk_table_id == owner_table_id:
+            continue
+        adjacency[fk_table_id].append(
+            (owner_table_id, row["fk_column_id"], row["owner_column_id"])
+        )
+        incoming[owner_table_id].add(fk_table_id)
+        if row["owner_is_pk"]:
+            adjacency[owner_table_id].append(
+                (fk_table_id, row["owner_column_id"], row["fk_column_id"])
+            )
+    for edges in adjacency.values():
+        edges.sort()
+    return adjacency, {table_id: len(sources) for table_id, sources in incoming.items()}
+
+
 def _find_table_join_hops(
     anchor_table_id: str,
     dest_table_id: str,
@@ -811,25 +916,7 @@ def _find_table_join_hops(
     can't reach (both endpoints are FK columns *into* the same identity hub,
     so there's no forward edge on either side to start from).
     """
-    rows = store().query_read(
-        _SEMANTIC_TABLE_EDGES,
-        {"database_id": database_id},
-    )
-    adjacency: dict[str, list[tuple[str, str, str]]] = defaultdict(list)
-    for row in rows:
-        fk_table_id = row["fk_table_id"]
-        owner_table_id = row["owner_table_id"]
-        if fk_table_id == owner_table_id:
-            continue
-        adjacency[fk_table_id].append(
-            (owner_table_id, row["fk_column_id"], row["owner_column_id"])
-        )
-        if row["owner_is_pk"]:
-            adjacency[owner_table_id].append(
-                (fk_table_id, row["owner_column_id"], row["fk_column_id"])
-            )
-    for edges in adjacency.values():
-        edges.sort()
+    adjacency, _fan_in = _semantic_table_graph(database_id)
 
     max_hops = (MAX_PATH_DEPTH + 2) // 4
     parents: dict[str, tuple[str, str, str] | None] = {anchor_table_id: None}
@@ -1515,3 +1602,196 @@ def find_kept_table_bridges(
             len(pairs),
         )
     return list(found.values()), bridge_paths, skipped
+
+
+def _format_join_hops(hop_pairs: list[tuple[str, str]]) -> list[dict]:
+    """Turn ``(source_column_id, target_column_id)`` pairs into prompt hops."""
+    col_ids = list(dict.fromkeys(cid for pair in hop_pairs for cid in pair))
+    names = _name_columns(col_ids)
+    col_ctx = fetch_col_table_contexts(col_ids)
+    hops: list[dict] = []
+    for source_id, target_id in hop_pairs:
+        source_context = col_ctx.get(source_id, {})
+        target_context = col_ctx.get(target_id, {})
+        hops.append(
+            {
+                "source_schema": source_context.get("schema_name", ""),
+                "source_table": source_context.get("table_name", ""),
+                "source_column": names.get(source_id, ""),
+                "target_schema": target_context.get("schema_name", ""),
+                "target_table": target_context.get("table_name", ""),
+                "target_column": names.get(target_id, ""),
+            }
+        )
+    return hops
+
+
+def _best_specific_path(
+    start: str,
+    goal: str,
+    adjacency: dict[str, list[tuple[str, str, str]]],
+    fan_in: dict[str, int],
+    kept: set[str],
+    *,
+    max_hops: int,
+    hub_fanin: int,
+) -> list[tuple[str, str]] | None:
+    """Shortest path from *start* to *goal* that avoids a shared-dimension hub.
+
+    Hop count wins, then the highest intermediate fan-in. A shared dimension
+    (fan-in at or above *hub_fanin*) is not traversed: the shorter path
+    through a person or status table answers a different question than the
+    longer path through the tables that actually relate the two endpoints.
+    """
+    seen: set[str] = set()
+    queue: list[tuple[int, int, int, str, list[tuple[str, str]]]] = [
+        (0, 0, 0, start, [])
+    ]
+    while queue:
+        depth, score, _tie, table_id, hops = heapq.heappop(queue)
+        if table_id in seen:
+            continue
+        seen.add(table_id)
+        if table_id == goal and hops:
+            return hops
+        if depth >= max_hops:
+            continue
+        for index, (next_table_id, source_col_id, target_col_id) in enumerate(
+            adjacency.get(table_id, [])
+        ):
+            if next_table_id in seen:
+                continue
+            step = 0
+            if next_table_id != goal and next_table_id not in kept:
+                step = fan_in.get(next_table_id, 0)
+                if step >= hub_fanin:
+                    continue
+            heapq.heappush(
+                queue,
+                (
+                    depth + 1,
+                    max(score, step),
+                    index,
+                    next_table_id,
+                    [*hops, (source_col_id, target_col_id)],
+                ),
+            )
+    return None
+
+
+def find_specific_bridges_between_kept_tables(
+    table_ids: list[str],
+    *,
+    max_hops: int = 4,
+    max_new_tables: int = 4,
+    hub_fanin: int = SHARED_DIMENSION_FANIN,
+) -> tuple[list[dict], list[list[dict]]]:
+    """Add the intermediates that actually connect kept tables the filter kept apart.
+
+    ``find_kept_table_bridges`` only restores a table the relevance filter
+    already saw and dropped. A retrieved filter table often has no row in
+    that candidate pool for the tables between it and the fact table, so the
+    join is discarded and SQL generation drops the filter. This walk is
+    allowed to name those intermediates. It refuses a path whose intermediate
+    is a shared dimension (see ``SHARED_DIMENSION_FANIN``) so a ubiquitous
+    audit key is not offered as the relationship.
+    """
+    kept = [table_id for table_id in dict.fromkeys(table_ids) if table_id]
+    if len(kept) < 2:
+        return [], []
+    database_id = _table_database_id(kept[0])
+    if not database_id:
+        return [], []
+    adjacency, fan_in = _semantic_table_graph(database_id)
+    kept_set = set(kept)
+
+    # Tables already joined to each other need no new intermediate.
+    component: dict[str, int] = {}
+    next_component = 0
+    for table_id in kept:
+        if table_id in component:
+            continue
+        component[table_id] = next_component
+        frontier = [table_id]
+        while frontier:
+            current = frontier.pop()
+            for next_table_id, _source, _target in adjacency.get(current, []):
+                if next_table_id in kept_set and next_table_id not in component:
+                    component[next_table_id] = next_component
+                    frontier.append(next_table_id)
+        next_component += 1
+
+    pairs = [
+        (a_id, b_id)
+        for a_id, b_id in itertools.combinations(kept, 2)
+        if component.get(a_id) != component.get(b_id)
+    ]
+    # A kept table that nothing else in the set can reach is the one a filter
+    # lives on. Try it before pairs that are merely far apart, so the cap
+    # spends its budget on the disconnected filter.
+    pairs.sort(
+        key=lambda pair: (
+            min(
+                sum(1 for other in kept if component.get(other) == component.get(end))
+                for end in pair
+            ),
+            pair,
+        )
+    )
+
+    found: dict[str, dict] = {}
+    paths: list[list[dict]] = []
+    # Reconsider every still-disconnected pair and keep the shortest specific
+    # path. Pair order must not spend the cap on a longer route between two
+    # other tables before the short one is seen.
+    while len(found) < max_new_tables:
+        best: tuple | None = None
+        for a_id, b_id in pairs:
+            if component.get(a_id) == component.get(b_id):
+                continue
+            hop_pairs = _best_specific_path(
+                a_id,
+                b_id,
+                adjacency,
+                fan_in,
+                kept_set,
+                max_hops=max_hops,
+                hub_fanin=hub_fanin,
+            )
+            if not hop_pairs:
+                continue
+            contexts = fetch_col_table_contexts(
+                [target_id for _source_id, target_id in hop_pairs[:-1]]
+            )
+            intermediate_ids: list[str] = []
+            for _source_id, target_id in hop_pairs[:-1]:
+                table_id = contexts.get(target_id, {}).get("table_id")
+                if (
+                    table_id
+                    and table_id not in kept_set
+                    and table_id not in intermediate_ids
+                ):
+                    intermediate_ids.append(table_id)
+            new_ids = [
+                table_id for table_id in intermediate_ids if table_id not in found
+            ]
+            if not new_ids or len(found) + len(new_ids) > max_new_tables:
+                continue
+            rank = (len(hop_pairs), len(new_ids), a_id, b_id)
+            if best is None or rank < best[0]:
+                best = (rank, a_id, b_id, hop_pairs, new_ids)
+        if best is None:
+            break
+        _rank, a_id, b_id, hop_pairs, new_ids = best
+        names = _name_tables(new_ids)
+        source_component = component.get(a_id)
+        other_component = component.get(b_id)
+        for table_id, comp in list(component.items()):
+            if comp == other_component:
+                component[table_id] = source_component
+        for table_id in new_ids:
+            found.setdefault(
+                table_id, {"id": table_id, "name": names.get(table_id, "")}
+            )
+        paths.append(_format_join_hops(hop_pairs))
+    return list(found.values()), paths
